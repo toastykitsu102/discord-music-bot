@@ -217,7 +217,7 @@ def command_requires_permission(command_name: str):
         @functools.wraps(func)
         async def wrapper(ctx, *args, **kwargs):
             if not await has_command_permission(ctx, command_name.lower()):
-                await ctx.send(" You don't have permission to use this command.")
+                await ctx.send("You don't have permission to use this command.")
                 return
             return await func(ctx, *args, **kwargs)
         return wrapper
@@ -470,8 +470,6 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN not found in environment")
 
-
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -492,105 +490,70 @@ class MusicPlayer:
         self.current = None
         self.status_task = None
         self.start_time = None
-        self.preloaded = {}    # title → preloaded AudioTrack
+        self.preloaded = {}    # guild_id → AudioTrack source cache
         queues[ctx.guild.id] = self
 
     async def preload_next(self):
-        """Preload the next track's FFmpeg source to minimize gaps."""
+        """Preload the next track in the queue."""
         if not self.queue:
-            return
+            return  # nothing to preload
 
-        next_track = self.queue[0]
-        if next_track.title in self.preloaded:
-            return  # Already preloaded
+        next_track = self.queue[0]  # peek at the next track
 
-        # Build full path
+        # Try to get a valid file path attribute
+        track_path_attr = getattr(next_track, 'file_path', None) or getattr(next_track, 'filename', None)
+        if not track_path_attr:
+            raise AttributeError("Next track object has no valid file path ('file_path' or 'filename')")
+
+        # Construct the full path in the guild's music folder
         music_folder = get_guild_music_folder(self.ctx.guild.id)
-        full_path = os.path.join(music_folder, next_track.filename)
+        full_path = os.path.join(music_folder, track_path_attr)
+
+        # Check if file exists before preloading
         if not os.path.isfile(full_path):
             raise FileNotFoundError(f"Audio file not found: {full_path}")
 
-        # Build FFmpeg source with proper buffering options
-        raw_source = discord.FFmpegPCMAudio(
-            full_path,
-            executable=ffmpeg_path,
-            before_options='-nostdin',
-            options='-vn -sn -dn -loglevel quiet'
-        )
+        # Preload logic (depends on your bot's player)
+        self.next_audio_source = full_path  # for example, store the path for next playback
+        logging.info(f"Preloaded next track: {full_path}")
 
-        volume = get_guild_volume(self.ctx.guild.id)
-        source = PCMVolumeTransformer(raw_source, volume=volume)
-
-        self.preloaded[next_track.title] = AudioTrack(
-            source=source,
-            title=next_track.title,
-            duration=next_track.duration,
-            filename=next_track.filename
-        )
-        logger.info(f"Preloaded next track: {full_path}")
 
     async def update_status(self):
         while self.ctx.voice_client and self.ctx.voice_client.is_playing():
             if self.current and self.start_time:
                 elapsed = (discord.utils.utcnow() - self.start_time).total_seconds()
                 mins, secs = divmod(int(elapsed), 60)
-                await bot.change_presence(
-                    activity=discord.Game(
-                        name=f"{self.current.title} [{mins}:{secs:02d}/{self.current.duration}]"
-                    )
-                )
+                await bot.change_presence(activity=discord.Game(name=f"{self.current.title} [{mins}:{secs:02d}/{self.current.duration}]"))
             await asyncio.sleep(1)
-
-    async def _buffer_source(self, source, warmup_ms: int = 150):
-        """
-        Warm up FFmpeg source by discarding a bit of PCM before starting playback.
-        Reduces initial skips when playback begins.
-        """
-        loop = asyncio.get_running_loop()
-        try:
-            bytes_per_ms = 192  # 48kHz stereo s16le ≈ 192 bytes/ms
-            discard_bytes = bytes_per_ms * warmup_ms
-            await loop.run_in_executor(None, lambda: source.read(discard_bytes))
-        except Exception as e:
-            logger.warning(f"Buffer warm-up failed: {e}")
 
     async def play_next(self):
         if not self.queue or not self.ctx.voice_client:
             await bot.change_presence(activity=None)
             return
 
-        # Get next track, use preloaded if available
+        # Use preloaded track if available
         next_track = self.queue.pop(0)
         self.current = self.preloaded.pop(next_track.title, next_track)
         self.start_time = discord.utils.utcnow()
 
-        logger.info(
-            f"Now playing: '{self.current.title}' | Duration: {self.current.duration} | "
-            f"Guild: {self.ctx.guild.name} ({self.ctx.guild.id})"
-        )
+        logger.info(f"Now playing: '{self.current.title}' | Duration: {self.current.duration} | Guild: {self.ctx.guild.name} ({self.ctx.guild.id})")
 
         if self.status_task:
             self.status_task.cancel()
         self.status_task = asyncio.create_task(self.update_status())
 
-        async def start_playback():
-            # Pre-buffer before playback
-            await self._buffer_source(self.current.source)
+        def after_playing(error):
+            if error:
+                logger.error(f"Error playing '{self.current.title}': {error}")
+            try:
+                asyncio.run_coroutine_threadsafe(self.play_next(), bot.loop)
+            except RuntimeError as e:
+                logger.error(f"Async error: {e}")
 
-            def after_playing(error):
-                if error:
-                    logger.error(f"Error playing '{self.current.title}': {error}")
-                try:
-                    asyncio.run_coroutine_threadsafe(self.play_next(), bot.loop)
-                except RuntimeError as e:
-                    logger.error(f"Async error: {e}")
+        self.ctx.voice_client.play(self.current.source, after=after_playing)
 
-            self.ctx.voice_client.play(self.current.source, after=after_playing)
-
-            # Preload next track asynchronously
-            asyncio.create_task(self.preload_next())
-
-        asyncio.create_task(start_playback())
+        # Preload next track automatically
+        await self.preload_next()
 
 
 import string
@@ -651,6 +614,9 @@ command_categories = {
         'skip': 'Skip the current song.',
         'np': 'Show the currently playing song.',
         'volume': 'Set or show the playback volume (0-100).',
+        'queue': 'Show the current music queue.',
+        'clear': 'Clear the current music queue.',
+        'shuffle': 'Shuffle the current queue.',
         'add': 'Add MP3 songs by attaching files.',
         'rmsong': 'Remove a song from the server.',
         'songs': 'List all available songs.',
@@ -665,13 +631,19 @@ command_categories = {
     'Permissions': {
         'custom': 'Customize command permissions for roles.',
         'rmrole': 'Remove a role from command permissions.',
-        'perms': 'Show custom command permissions.'
+        'perms': 'Show custom command permissions.',
+        'gencode': 'Generate activation codes (admin only).'
     },
     'Queue': {
-        'rmq': 'Remove a song from the queue by index.',
-        'queue': 'Show the current music queue.',
-        'clear': 'Clear the current music queue.',
-        'shuffle': 'Shuffle the current queue.',
+        'rmq': 'Remove a song from the queue by index.'
+    },
+    'Moderation': {
+        'muteduration': 'Change mute duration for AutoMod.',
+        'banword': 'Add, remove, or list banned words for AutoMod.',
+        'spam': 'Enable or disable spam protection.',
+        'automoda': 'Enable or disable AutoMod entirely.',
+        'automodstatus': 'Show current AutoMod settings.',
+        'setmodlog': 'Set the moderation log channel.'
     }
 }
 
@@ -683,26 +655,6 @@ command_categories = {
 async def on_ready():
     print(f"Logged in as {bot.user}")
     logger.info(f"Logged in as {bot.user}")
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    """Auto-disconnect if the bot is alone in VC for 2 minutes."""
-    if member.guild.voice_client:
-        vc = member.guild.voice_client
-        # Check if bot is in a VC and now alone
-        if len(vc.channel.members) == 1 and vc.channel.members[0] == bot.user:
-            await asyncio.sleep(120)  # wait 2 minutes
-            # Check again (someone might have joined back)
-            if len(vc.channel.members) == 1 and vc.channel.members[0] == bot.user:
-                queues.pop(member.guild.id, None)  # clear player state
-                await vc.disconnect()
-                await bot.change_presence(activity=None)
-                channel = discord.utils.get(member.guild.text_channels, name="general")
-                if channel:
-                    try:
-                        await channel.send(" I left VC because I was alone for 2 minutes.")
-                    except discord.Forbidden:
-                        pass
 
 
 @bot.command(name='join')
@@ -749,17 +701,20 @@ async def play_command(ctx, filename: str = None):
     if not ctx.author.voice:
         return await ctx.send("You must be in a voice channel.")
 
+    # Ensure a MusicPlayer exists
     if ctx.guild.id not in queues:
         queues[ctx.guild.id] = MusicPlayer(ctx)
     player = queues[ctx.guild.id]
 
     music_dir = get_guild_music_folder(ctx.guild.id)
 
+    # If no filename provided, try default song
     if not filename:
-        path = os.path.join(music_dir)
+        default_song = "test108.mp3"  # change as needed
+        path = os.path.join(music_dir, default_song)
         if not os.path.exists(path):
             return await ctx.send("No song specified, and default song not found.")
-        files = [f for f in os.listdir(music_dir) if f.lower().endswith('.mp3')]
+        files = [default_song]
     else:
         files = [f for f in os.listdir(music_dir)
                  if f.lower().endswith('.mp3') and filename.lower() in f.lower()]
@@ -767,6 +722,7 @@ async def play_command(ctx, filename: str = None):
             return await ctx.send("No match.")
         path = os.path.join(music_dir, files[0])
 
+    # Get duration
     try:
         res = subprocess.run([ffprobe_path, '-v', 'error', '-show_entries', 'format=duration',
                               '-of', 'default=noprint_wrappers=1:nokey=1', path],
@@ -777,6 +733,7 @@ async def play_command(ctx, filename: str = None):
     except Exception:
         dur = "?:??"
 
+# Example inside play_command:
     source = discord.FFmpegPCMAudio(
         path,
         executable=ffmpeg_path,
@@ -784,21 +741,26 @@ async def play_command(ctx, filename: str = None):
         options='-f s16le -ar 48000 -ac 2 -loglevel quiet'
     )
 
+    # Apply guild volume
     volume = get_guild_volume(ctx.guild.id)
     source = PCMVolumeTransformer(source, volume=volume)
 
-    track = AudioTrack(source, os.path.splitext(files[0])[0], dur, filename=files[0])
-    player.queue.append(track)
-    await player.preload_next()
 
-    if ctx.voice_client:  # only play if already connected
-        if not ctx.voice_client.is_playing():
-            await player.play_next()
-    else:
-        return await ctx.send(" Bot is not in a voice channel. Use `!join` first.")
+    track = AudioTrack(source, os.path.splitext(files[0])[0], dur, filename=files[0])
+
+    # Connect if not connected
+    if not ctx.voice_client:
+        await ctx.author.voice.channel.connect()
+
+    # Queue the track
+    player.queue.append(track)
+    await player.preload_next()  # preload next track
+
+    # Play if nothing is playing
+    if not ctx.voice_client.is_playing():
+        await player.play_next()
 
     await ctx.send(f"Queued {track.title}")
-
 
 @bot.command(name="on")
 @log_exceptions
@@ -861,9 +823,9 @@ async def tech_support(ctx, *, message: str = None):
             failed_to.append(f"{support_id} ({type(e).__name__}: {e})")
 
     if sent_to:
-        await ctx.send(f"✅ Message sent to support tech support")
+        await ctx.send(f" Message sent to support tech support")
     if failed_to:
-        await ctx.send(f"⚠️ Could not deliver to tech support")
+        await ctx.send(f" Could not deliver to tech support")
         
 @bot.command(name="songs")
 @activated_only
@@ -881,8 +843,8 @@ async def songs_command(ctx):
     active_tokens[ctx.guild.id] = {"token": token, "expires": time.time() + 300}  # 5 min expiry
 
     await ctx.send(
-        f" {len(files)} songs available.\n"
-        f" View here: {public_url}/music/{ctx.guild.id}/song_list.html?token={token}\n"
+        f"{len(files)} songs available.\n"
+        f"View here: {public_url}/music/{ctx.guild.id}/song_list.html?token={token}\n"
         f"(link expires in 5 minutes)"
     )
 
@@ -896,7 +858,7 @@ async def songs_command(ctx):
 async def addsong_command(ctx):
 
     if not ctx.message.attachments:
-        return await ctx.send(" Please attach MP3 files.")
+        return await ctx.send("Please attach MP3 files.")
 
     music_dir = get_guild_music_folder(ctx.guild.id)
     added, skipped = [], []
@@ -911,7 +873,7 @@ async def addsong_command(ctx):
         # Check storage before saving
         current_size = get_guild_storage_used(ctx.guild.id)
         if current_size + attachment.size > MAX_STORAGE_BYTES:
-            await ctx.send(f" Cannot add `{attachment.filename}` – "
+            await ctx.send(f"Cannot add `{attachment.filename}` – "
                            f"20 GB storage limit reached for this server.")
             skipped.append(attachment.filename)
             continue
@@ -929,11 +891,11 @@ async def addsong_command(ctx):
 
     msg = ""
     if added:
-        msg += f" Added songs: {', '.join(added)}\n🔗 {public_url}/music/{ctx.guild.id}/song_list.html"
+        msg += f"Added songs: {', '.join(added)}\n🔗 {public_url}/music/{ctx.guild.id}/song_list.html"
     if skipped:
         msg += f"\n Skipped: {', '.join(skipped)}"
     if not msg:
-        msg = " No songs were added."
+        msg = "No songs were added."
     await ctx.send(msg)
 
 @bot.command(name="storage")
@@ -952,7 +914,7 @@ async def storage_command(ctx):
     percent = (used / limit) * 100 if limit > 0 else 0
 
     await ctx.send(
-        f" Storage used: **{used_gb:.2f} GB** / {limit_gb:.0f} GB "
+        f"Storage used: **{used_gb:.2f} GB** / {limit_gb:.0f} GB "
         f"({percent:.1f}%)"
     )
 
@@ -1031,12 +993,12 @@ async def customize_command(ctx, role: discord.Role, command_name: str):
         settings["command_roles"][command_name] = []
 
     if role.id in settings["command_roles"][command_name]:
-        return await ctx.send(f"`{role.name}` already has permission for `{command_name}`.")
+        return await ctx.send(f" `{role.name}` already has permission for `{command_name}`.")
 
     settings["command_roles"][command_name].append(role.id)
     save_settings(guild_id, settings)
 
-    await ctx.send(f"Role `{role.name}` **added** to allowed list for `{command_name}`.")
+    await ctx.send(f" Role `{role.name}` **added** to allowed list for `{command_name}`.")
 
 @bot.command(name="rmrole")
 @activated_only
@@ -1059,7 +1021,7 @@ async def remove_role_command(ctx, role: discord.Role, command_name: str):
         del settings["command_roles"][command_name]  # Optional: remove key if empty
 
     save_settings(guild_id, settings)
-    await ctx.send(f"Removed `{role.name}` from `{command_name}` permission list.")
+    await ctx.send(f" Removed `{role.name}` from `{command_name}` permission list.")
 
 
 @bot.command(name="perms")
@@ -1075,9 +1037,9 @@ async def show_permissions(ctx):
     lines = []
     for cmd, role_ids in command_roles.items():
         roles = [ctx.guild.get_role(rid).mention for rid in role_ids if ctx.guild.get_role(rid)]
-        lines.append(f"`{cmd}` → {', '.join(roles) if roles else '❓ Unknown role(s)'}")
+        lines.append(f"`{cmd}` → {', '.join(roles) if roles else ' Unknown role(s)'}")
 
-    await ctx.send("**Custom Command Permissions:**\n" + "\n".join(lines))
+    await ctx.send(" **Custom Command Permissions:**\n" + "\n".join(lines))
 
 @bot.command(name='pause')
 @activated_only
@@ -1135,7 +1097,7 @@ async def stop_command(ctx):
             player.status_task.cancel()
         await bot.change_presence(activity=None)
         await ctx.voice_client.disconnect()
-        await ctx.send("Music stopped and bot disconnected.")
+        await ctx.send(" Music stopped and bot disconnected.")
     else:
         await ctx.send("Nothing is playing.")
 
@@ -1146,7 +1108,7 @@ async def generate_code(ctx, number: int = 1):
     # Only allow you or specific IDs to generate codes
     ADMIN_IDS = [1285025702231670795]  # Replace with your Discord ID
     if ctx.author.id not in ADMIN_IDS:
-        return await ctx.send("You are not allowed to generate codes")
+        return await ctx.send(" You are not allowed to generate codes.")
 
     activations = load_activations()
     codes = []
@@ -1167,7 +1129,7 @@ async def generate_code(ctx, number: int = 1):
 async def volume_command(ctx, vol: int = None):
     """Set or view playback volume (0–200%)."""
     if not ctx.voice_client:
-        return await ctx.send("Bot is not connected to a voice channel.")
+        return await ctx.send(" Bot is not connected to a voice channel.")
 
     # Show current
     if vol is None:
@@ -1185,7 +1147,563 @@ async def volume_command(ctx, vol: int = None):
     if ctx.voice_client.source and isinstance(ctx.voice_client.source, PCMVolumeTransformer):
         ctx.voice_client.source.volume = new_volume
 
-    await ctx.send(f"Volume set to {vol}%")
+    await ctx.send(f" Volume set to {vol}%")
+
+# =====================
+# Moderation Logging & AutoMod
+# =====================
+
+MODLOG_CHANNEL_NAME = None
+AUTOMOD_MUTE_ROLE = "Muted"
+
+# Ensure intents
+intents.members = True
+intents.guilds = True
+intents.messages = True
+intents.message_content = True
+
+# ---------------------
+# Helpers
+# ---------------------
+async def get_modlog_channel(guild: discord.Guild):
+    """Get or create the guild's mod-log channel (configurable)."""
+    settings = load_settings(guild.id)
+    channel_id = settings.get("modlog_channel")
+
+    # Try configured channel first
+    if channel_id:
+        channel = guild.get_channel(channel_id)
+        if channel:
+            return channel
+
+    # If no default name is set, just stop
+    if MODLOG_CHANNEL_NAME is None:
+        return None
+
+    # Fallback: default channel by name
+    channel = discord.utils.get(guild.text_channels, name=MODLOG_CHANNEL_NAME)
+    if channel is None:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True)
+        }
+        channel = await guild.create_text_channel(MODLOG_CHANNEL_NAME, overwrites=overwrites)
+
+    # Save channel ID to settings
+    settings["modlog_channel"] = channel.id
+    save_settings(guild.id, settings)
+    return channel
+
+
+def get_automod_settings(guild_id: int) -> dict:
+    settings = load_settings(guild_id)
+    automod = settings.get("automod")
+
+    # Always enforce dict structure
+    if not isinstance(automod, dict):
+        automod = {}
+
+    # Fill defaults if missing
+    automod.setdefault("enabled", False)
+    automod.setdefault("spam_protection", False)
+    automod.setdefault("banned_words", [])
+    automod.setdefault("mute_duration", 60)
+
+    # Save back in case it was corrupted
+    settings["autmodlog_channel"] = automod
+    save_settings(guild_id, settings)
+
+    return automod
+    settings = load_settings(guild_id)
+    automod = settings.get("automod")
+
+    # Fix if automod is missing or corrupted
+    if not isinstance(automod, dict):
+        automod = {
+            "enabled": False,
+            "spam_protection": False,
+            "banned_words": [],
+            "mute_duration": 60
+        }
+        settings["automod"] = automod
+        save_settings(guild_id, settings)
+
+    return automod
+
+
+def save_automod_settings(guild_id: int, automod_settings: dict):
+    settings = load_settings(guild_id)
+    settings["automod"] = automod_settings
+    save_settings(guild_id, settings)
+
+# ---------------------
+# Command to set mod-log channel
+# ---------------------
+@bot.command(name="setmodlog")
+async def set_modlog(ctx, channel: discord.TextChannel):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send(" Admin only.")
+    settings = load_settings(ctx.guild.id)
+    settings["modlog_channel"] = channel.id  # <-- FIXED
+    save_settings(ctx.guild.id, settings)
+    await ctx.send(f"Moderation logs will now be sent to {channel.mention}")
+
+# =====================
+# Moderation Logging (Dyno-style plain text)
+# =====================
+
+# --- Member events ---
+# =====================
+# Moderation Logging (Dyno-style, no emojis)
+# =====================
+
+# =====================
+# Moderation Logging (Dyno-style)
+# =====================
+
+async def fetch_audit(guild, action, target_id=None):
+    """Fetch the latest audit log entry for a given action and optional target."""
+    await asyncio.sleep(2)  # wait for audit logs to update
+    try:
+        async for entry in guild.audit_logs(action=action, limit=5):
+            if target_id is None or entry.target.id == target_id:
+                return entry
+    except Exception:
+        return None
+    return None
+
+# --- Member join/leave ---
+@bot.event
+async def on_member_join(member):
+    channel = await get_modlog_channel(member.guild)
+    await channel.send(f"{member} joined the server.")
+
+@bot.event
+async def on_member_remove(member):
+    guild = member.guild
+    channel = await get_modlog_channel(guild)
+
+    # Check if kicked
+    entry = await fetch_audit(guild, discord.AuditLogAction.kick, member.id)
+    if entry:
+        return await channel.send(f"{member} was kicked by {entry.user}. Reason: {entry.reason or 'No reason provided'}")
+
+    await channel.send(f"{member} left the server.")
+
+# --- Nickname, roles, timeout ---
+@bot.event
+async def on_member_update(before, after):
+    channel = await get_modlog_channel(after.guild)
+
+    # Timeout changes
+    if before.communication_disabled_until != after.communication_disabled_until:
+        entry = await fetch_audit(after.guild, discord.AuditLogAction.member_update, after.id)
+        if after.communication_disabled_until:  # timeout added
+            await channel.send(
+                f"{after} was timed out by {entry.user if entry else 'Unknown'} "
+                f"until {after.communication_disabled_until}. "
+                f"Reason: {entry.reason if entry else 'No reason provided'}"
+            )
+        else:
+            await channel.send(f"{after}'s timeout was removed.")
+
+    # Nickname changes
+    if before.nick != after.nick:
+        old_nick = before.nick or before.name
+        new_nick = after.nick or after.name
+        entry = await fetch_audit(after.guild, discord.AuditLogAction.member_update, after.id)
+        if entry:
+            await channel.send(
+                f"Nickname changed for {after}: {old_nick} → {new_nick} "
+                f"(by {entry.user}; Reason: {entry.reason or 'No reason provided'})"
+            )
+        else:
+            await channel.send(f"Nickname changed for {after}: {old_nick} → {new_nick}")
+
+    # Role changes
+    if before.roles != after.roles:
+        added = [r.name for r in after.roles if r not in before.roles]
+        removed = [r.name for r in before.roles if r not in after.roles]
+        entry = await fetch_audit(after.guild, discord.AuditLogAction.member_role_update, after.id)
+        if added:
+            await channel.send(f"{after} gained role(s): {', '.join(added)} (by {entry.user if entry else 'Unknown'})")
+        if removed:
+            await channel.send(f"{after} lost role(s): {', '.join(removed)} (by {entry.user if entry else 'Unknown'})")
+
+# --- Bans / Unbans ---
+@bot.event
+async def on_member_ban(guild, user):
+    channel = await get_modlog_channel(guild)
+    entry = await fetch_audit(guild, discord.AuditLogAction.ban, user.id)
+    if entry:
+        await channel.send(f"{user} was banned by {entry.user}. Reason: {entry.reason or 'No reason provided'}")
+    else:
+        await channel.send(f"{user} was banned from the server.")
+
+@bot.event
+async def on_member_unban(guild, user):
+    channel = await get_modlog_channel(guild)
+    entry = await fetch_audit(guild, discord.AuditLogAction.unban, user.id)
+    if entry:
+        await channel.send(f"{user} was unbanned by {entry.user}.")
+    else:
+        await channel.send(f"{user} was unbanned from the server.")
+
+# --- Channel changes ---
+@bot.event
+async def on_guild_channel_create(channel):
+    log = await get_modlog_channel(channel.guild)
+    entry = await fetch_audit(channel.guild, discord.AuditLogAction.channel_create, channel.id)
+    if entry:
+        await log.send(f"Channel created: {channel.mention} (by {entry.user})")
+    else:
+        await log.send(f"Channel created: {channel.mention}")
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    log = await get_modlog_channel(channel.guild)
+    entry = await fetch_audit(channel.guild, discord.AuditLogAction.channel_delete, channel.id)
+    if entry:
+        await log.send(f"Channel deleted: {channel.name} (by {entry.user})")
+    else:
+        await log.send(f"Channel deleted: {channel.name}")
+
+@bot.event
+async def on_guild_channel_update(before, after):
+    log = await get_modlog_channel(after.guild)
+    changes = []
+    if before.name != after.name:
+        changes.append(f"Name: {before.name} → {after.name}")
+    if before.overwrites != after.overwrites:
+        changes.append("Permissions updated")
+    if hasattr(before, "topic") and before.topic != after.topic:
+        changes.append(f"Topic: {before.topic} → {after.topic}")
+    if changes:
+        entry = await fetch_audit(after.guild, discord.AuditLogAction.channel_update, after.id)
+        if entry:
+            await log.send("Channel updated by {}:\n{}".format(entry.user, "\n".join(changes)))
+        else:
+            await log.send("Channel updated:\n" + "\n".join(changes))
+
+    channel = await get_modlog_channel(after.guild)
+
+    # Timeout changes
+    if before.communication_disabled_until != after.communication_disabled_until:
+        entry = await fetch_audit(after.guild, discord.AuditLogAction.member_update, target_id=after.id)
+        if after.communication_disabled_until:  # new timeout
+            await channel.send(
+                f"{after} was timed out by {entry.user if entry else 'Unknown'} "
+                f"until {after.communication_disabled_until}. "
+                f"Reason: {entry.reason if entry else 'No reason provided'}"
+            )
+        else:
+            await channel.send(f"{after}'s timeout was removed.")
+
+    # Nickname changes
+    if before.nick != after.nick:
+        try:
+            entry = await after.guild.audit_logs(
+                action=discord.AuditLogAction.member_update,
+                limit=1
+            ).find(lambda e: e.target.id == after.id and e.changes.before.get("nick") != e.changes.after.get("nick"))
+        except Exception:
+            entry = None
+
+        old_nick = before.nick or before.name
+        new_nick = after.nick or after.name
+
+        if entry:
+            await channel.send(
+                f"Nickname changed for {after}: {old_nick} → {new_nick} "
+                f"(by {entry.user}; Reason: {entry.reason or 'No reason provided'})"
+            )
+        else:
+            await channel.send(f"Nickname changed for {after}: {old_nick} → {new_nick}")
+
+    # Role changes
+    if before.roles != after.roles:
+        added = [r.name for r in after.roles if r not in before.roles]
+        removed = [r.name for r in before.roles if r not in after.roles]
+        entry = await fetch_audit(after.guild, discord.AuditLogAction.member_role_update, target_id=after.id)
+        if added:
+            await channel.send(f"{after} gained role(s): {', '.join(added)} (by {entry.user if entry else 'Unknown'})")
+        if removed:
+            await channel.send(f"{after} lost role(s): {', '.join(removed)} (by {entry.user if entry else 'Unknown'})")
+
+# --- Ban / unban ---
+@bot.event
+async def on_member_ban(guild, user):
+    channel = await get_modlog_channel(guild)
+    entry = await fetch_audit(guild, discord.AuditLogAction.ban, target_id=user.id)
+    await channel.send(
+        f"{user} was banned by {entry.user if entry else 'Unknown'}. "
+        f"Reason: {entry.reason if entry else 'No reason provided'}"
+    )
+
+@bot.event
+async def on_member_unban(guild, user):
+    channel = await get_modlog_channel(guild)
+    entry = await fetch_audit(guild, discord.AuditLogAction.unban, target_id=user.id)
+    await channel.send(
+        f"{user} was unbanned by {entry.user if entry else 'Unknown'}."
+    )
+
+# --- Role events ---
+@bot.event
+async def on_guild_role_create(role):
+    channel = await get_modlog_channel(role.guild)
+    entry = await fetch_audit(role.guild, discord.AuditLogAction.role_create, target_id=role.id)
+    await channel.send(
+        f"Role created: {role.name} (by {entry.user if entry else 'Unknown'})"
+    )
+
+@bot.event
+async def on_guild_role_delete(role):
+    channel = await get_modlog_channel(role.guild)
+    entry = await fetch_audit(role.guild, discord.AuditLogAction.role_delete, target_id=role.id)
+    await channel.send(
+        f"Role deleted: {role.name} (by {entry.user if entry else 'Unknown'})"
+    )
+
+@bot.event
+async def on_guild_role_update(before, after):
+    channel = await get_modlog_channel(after.guild)
+    entry = await fetch_audit(after.guild, discord.AuditLogAction.role_update, target_id=after.id)
+    changes = []
+    if before.name != after.name:
+        changes.append(f"Name: {before.name} → {after.name}")
+    if before.permissions != after.permissions:
+        changes.append("Permissions updated")
+    if before.color != after.color:
+        changes.append(f"Color: {before.color} → {after.color}")
+    if changes:
+        await channel.send(
+            "Role updated:\n" + "\n".join(changes) +
+            f"\n(by {entry.user if entry else 'Unknown'})"
+        )
+
+# --- Channel events ---
+@bot.event
+async def on_guild_channel_create(channel_obj):
+    channel = await get_modlog_channel(channel_obj.guild)
+    entry = await fetch_audit(channel_obj.guild, discord.AuditLogAction.channel_create, target_id=channel_obj.id)
+    await channel.send(
+        f"Channel created: {channel_obj.name} (by {entry.user if entry else 'Unknown'})"
+    )
+
+@bot.event
+async def on_guild_channel_delete(channel_obj):
+    channel = await get_modlog_channel(channel_obj.guild)
+    entry = await fetch_audit(channel_obj.guild, discord.AuditLogAction.channel_delete, target_id=channel_obj.id)
+    await channel.send(
+        f"Channel deleted: {channel_obj.name} (by {entry.user if entry else 'Unknown'})"
+    )
+
+@bot.event
+async def on_guild_channel_update(before, after):
+    channel = await get_modlog_channel(after.guild)
+    entry = await fetch_audit(after.guild, discord.AuditLogAction.channel_update, target_id=after.id)
+    changes = []
+    if before.name != after.name:
+        changes.append(f"Name: {before.name} → {after.name}")
+    if before.overwrites != after.overwrites:
+        changes.append("Permissions updated")
+    if hasattr(before, "topic") and before.topic != after.topic:
+        changes.append(f"Topic: {before.topic} → {after.topic}")
+    if changes:
+        await channel.send(
+            "Channel updated:\n" + "\n".join(changes) +
+            f"\n(by {entry.user if entry else 'Unknown'})"
+        )
+
+
+# --- Emoji / sticker events ---
+@bot.event
+async def on_guild_emojis_update(guild, before, after):
+    channel = await get_modlog_channel(guild)
+    added = [e for e in after if e not in before]
+    removed = [e for e in before if e not in after]
+    if added:
+        await channel.send("Emoji(s) added: " + ", ".join(str(e) for e in added))
+    if removed:
+        await channel.send("Emoji(s) removed: " + ", ".join(str(e) for e in removed))
+
+@bot.event
+async def on_guild_stickers_update(guild, before, after):
+    channel = await get_modlog_channel(guild)
+    added = [s for s in after if s not in before]
+    removed = [s for s in before if s not in after]
+    if added:
+        await channel.send("Sticker(s) added: " + ", ".join(s.name for s in added))
+    if removed:
+        await channel.send("Sticker(s) removed: " + ", ".join(s.name for s in removed))
+
+# --- Ban / unban events ---
+@bot.event
+async def on_member_ban(guild, user):
+    channel = await get_modlog_channel(guild)
+    await channel.send(f"{user} was banned from the server.")
+
+@bot.event
+async def on_member_unban(guild, user):
+    channel = await get_modlog_channel(guild)
+    await channel.send(f"{user} was unbanned from the server.")
+
+
+
+
+# ---------------------
+# AutoMod system
+# ---------------------
+spam_tracker = {}  # user_id -> [timestamps]
+
+async def automod_mute(member: discord.Member, reason="AutoMod mute", duration=60):
+    guild = member.guild
+    role = discord.utils.get(guild.roles, name=AUTOMOD_MUTE_ROLE)
+    if role is None:
+        role = await guild.create_role(name=AUTOMOD_MUTE_ROLE)
+        for channel in guild.channels:
+            await channel.set_permissions(role, send_messages=False, speak=False)
+    await member.add_roles(role, reason=reason)
+    channel = await get_modlog_channel(guild)
+    await channel.send(f"{member} muted for {duration}s ({reason}).")
+    # Auto-unmute
+    await asyncio.sleep(duration)
+    if role in member.roles:
+        await member.remove_roles(role, reason="Auto unmute")
+        await channel.send(f" {member} has been unmuted.")
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    #  Bypass AutoMod if user is mod/admin (Manage Messages or higher)
+    if message.author.guild_permissions.manage_messages:
+        return await bot.process_commands(message)
+
+    s = get_automod_settings(message.guild.id)
+
+    # Safety: force dict
+    if not isinstance(s, dict):
+        print(f"AutoMod settings corrupted for guild {message.guild.id}, repairing...")
+        s = get_automod_settings(message.guild.id)  # This will rebuild defaults
+
+    if not s.get("enabled", False):
+        return await bot.process_commands(message)
+
+    # Banned word filter
+    if any(word in message.content.lower() for word in s.get("banned_words", [])):
+        await message.delete()
+        channel = await get_modlog_channel(message.guild)
+        if channel:
+            await channel.send(f"{message.author} used a banned word and was muted.")
+        await automod_mute(message.author, reason="Banned word", duration=s.get("mute_duration", 60))
+        return
+
+    # Spam filter
+    if s.get("spam_protection", False):
+        now = time.time()
+        history = spam_tracker.get(message.author.id, [])
+        history = [t for t in history if now - t < 10]  # 10s window
+        history.append(now)
+        spam_tracker[message.author.id] = history
+
+        if len(history) > 5:  # >5 messages in 10s
+            channel = await get_modlog_channel(message.guild)
+            if channel:
+                await channel.send(f"{message.author} triggered spam detection and was muted.")
+            await automod_mute(message.author, reason="Spam", duration=s.get("mute_duration", 60))
+            spam_tracker[message.author.id] = []
+
+    await bot.process_commands(message)
+
+# ---------------------
+# Admin Commands for AutoMod
+# ---------------------
+@bot.command(name="automoda")
+async def automod_toggle(ctx, option: str):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send("Admin only.")
+    s = get_automod_settings(ctx.guild.id)
+    if option.lower() == "enable":
+        s["enabled"] = True
+        await ctx.send("AutoMod enabled.")
+    elif option.lower() == "disable":
+        s["enabled"] = False
+        await ctx.send("AutoMod disabled.")
+    else:
+        return await ctx.send("Usage: `!automoda enable|disable`")
+    save_automod_settings(ctx.guild.id, s)
+
+@bot.command(name="spam")
+async def spam_toggle(ctx, option: str):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send("Admin only.")
+    s = get_automod_settings(ctx.guild.id)
+    if option.lower() == "enable":
+        s["spam_protection"] = True
+        await ctx.send("Spam protection enabled.")
+    elif option.lower() == "disable":
+        s["spam_protection"] = False
+        await ctx.send("Spam protection disabled.")
+    else:
+        return await ctx.send("Usage: `!spam enable|disable`")
+    save_automod_settings(ctx.guild.id, s)
+
+@bot.command(name="banword")
+async def banword_command(ctx, action: str = None, word: str = None):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send("Admin only.")
+    s = get_automod_settings(ctx.guild.id)
+
+    if action == "add" and word:
+        if word.lower() not in s["banned_words"]:
+            s["banned_words"].append(word.lower())
+            await ctx.send(f"Added banned word: `{word}`")
+        else:
+            await ctx.send(f"`{word}` already in banned list.")
+    elif action == "remove" and word:
+        if word.lower() in s["banned_words"]:
+            s["banned_words"].remove(word.lower())
+            await ctx.send(f"Removed banned word: `{word}`")
+        else:
+            await ctx.send(f"`{word}` not found in banned list.")
+    elif action == "list":
+        if not s["banned_words"]:
+            await ctx.send("No banned words set.")
+        else:
+            await ctx.send(" **Banned words:** " + ", ".join(s["banned_words"]))
+    else:
+        return await ctx.send("Usage: `!banword add <word> | remove <word> | list`")
+
+    save_automod_settings(ctx.guild.id, s)
+
+@bot.command(name="muteduration")
+async def mute_duration_command(ctx, seconds: int = None):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send(" Admin only.")
+    if seconds is None or seconds <= 0:
+        return await ctx.send("Usage: `!muteduration <seconds>`")
+    s = get_automod_settings(ctx.guild.id)
+    s["mute_duration"] = seconds
+    save_automod_settings(ctx.guild.id, s)
+    await ctx.send(f" Mute duration set to {seconds} seconds.")
+
+@bot.command(name="automodstatus")
+async def automod_status(ctx):
+    """Show current AutoMod settings."""
+    s = get_automod_settings(ctx.guild.id)
+    banned = ", ".join(s["banned_words"]) if s["banned_words"] else "None"
+    await ctx.send(
+        f"🔧 **AutoMod Settings:**\n"
+        f"Enabled: {s['enabled']}\n"
+        f"Spam protection: {s['spam_protection']}\n"
+        f"Mute duration: {s['mute_duration']}s\n"
+        f"Banned words: {banned}"
+    )
+
+
 
 
 def start_gui():
@@ -1225,7 +1743,7 @@ UPLOAD_PATH = "/Music-Bot/main.py"
 RESTART_SCRIPT = "/Music-Bot/restart.sh"
 
 AUTHORIZED_USERS = {
-    "admin": "password123"  # example
+    "admin": "ijwfo"  # example
 }
 
 class MyHandler(BaseHTTPRequestHandler):
@@ -1464,11 +1982,11 @@ print("Public URL:", public_url)
 async def queue_command(ctx):
     player = queues.get(ctx.guild.id)
     if not player or not player.queue:
-        return await ctx.send(" Queue is empty.")
+        return await ctx.send("Queue is empty.")
     lines = []
     for i, track in enumerate(player.queue, start=1):
         lines.append(f"{i}. {track.title} ({track.duration})")
-    await ctx.send(" **Current Queue:**\n" + "\n".join(lines[:15]) + (f"\n… and {len(lines)-15} more." if len(lines) > 15 else ""))
+    await ctx.send("**Current Queue:**\n" + "\n".join(lines[:15]) + (f"\n… and {len(lines)-15} more." if len(lines) > 15 else ""))
 
 @bot.command(name="np")
 @activated_only
@@ -1478,7 +1996,7 @@ async def queue_command(ctx):
 async def nowplaying_command(ctx):
     player = queues.get(ctx.guild.id)
     if not player or not player.current:
-        return await ctx.send(" Nothing is playing.")
+        return await ctx.send("Nothing is playing.")
     await ctx.send(f"Now playing: **{player.current.title}** ({player.current.duration})")
 
 @bot.command(name="rmq")
@@ -1492,9 +2010,9 @@ async def removefromqueue_command(ctx, index: int):
         return await ctx.send(" Queue is empty.")
     if 1 <= index <= len(player.queue):
         removed = player.queue.pop(index-1)
-        await ctx.send(f" Removed **{removed.title}** from queue.")
+        await ctx.send(f"Removed **{removed.title}** from queue.")
     else:
-        await ctx.send(" Invalid index.")
+        await ctx.send("Invalid index.")
 
 @bot.command(name="clear")
 @activated_only
@@ -1504,9 +2022,9 @@ async def removefromqueue_command(ctx, index: int):
 async def clearqueue_command(ctx):
     player = queues.get(ctx.guild.id)
     if not player:
-        return await ctx.send(" Queue is already empty.")
+        return await ctx.send("Queue is already empty.")
     player.queue.clear()
-    await ctx.send("Cleared the queue.")
+    await ctx.send(" Cleared the queue.")
 
 @bot.command(name="shuffle")
 @activated_only
@@ -1519,7 +2037,7 @@ async def shufflequeue_command(ctx):
     if not player or not player.queue:
         return await ctx.send(" Queue is empty.")
     random.shuffle(player.queue)
-    await ctx.send(" Queue shuffled.")
+    await ctx.send("Queue shuffled.")
 
 # =====================
 # Playlist System
@@ -1547,11 +2065,11 @@ def save_playlists(guild_id: int, playlists: dict):
 async def saveplaylist_command(ctx, name: str):
     player = queues.get(ctx.guild.id)
     if not player or not player.queue:
-        return await ctx.send(" Queue is empty, nothing to save.")
+        return await ctx.send("Queue is empty, nothing to save.")
     playlists = load_playlists(ctx.guild.id)
     playlists[name] = [{"title": t.title, "duration": t.duration, "filename": t.title + ".mp3"} for t in player.queue]
     save_playlists(ctx.guild.id, playlists)
-    await ctx.send(f" Saved current queue as playlist **{name}**.")
+    await ctx.send(f"Saved current queue as playlist **{name}**.")
 
 @bot.command(name="loadpl")
 @activated_only
@@ -1562,10 +2080,10 @@ async def loadplaylist_command(ctx, name: str):
     playlists = load_playlists(ctx.guild.id)
     if name not in playlists:
         return await ctx.send(f"No playlist named `{name}`.")
-
     music_dir = get_guild_music_folder(ctx.guild.id)
     tracks = []
 
+    # Get saved guild volume (default 1.0 = 100%)
     volume = get_guild_volume(ctx.guild.id)
 
     for entry in playlists[name]:
@@ -1584,6 +2102,7 @@ async def loadplaylist_command(ctx, name: str):
         except Exception:
             dur = "?:??"
 
+        # Create FFmpeg source and wrap in PCMVolumeTransformer
         raw_source = discord.FFmpegPCMAudio(
             path,
             executable=ffmpeg_path,
@@ -1601,12 +2120,9 @@ async def loadplaylist_command(ctx, name: str):
 
     await ctx.send(f" Loaded playlist **{name}** with {len(tracks)} track(s).")
 
-    if ctx.voice_client and tracks:
-        if not ctx.voice_client.is_playing():
-            await player.play_next()
-    else:
-        return await ctx.send(" Bot is not in a voice channel. Use `!join` first.")
-
+    if not ctx.voice_client and tracks:
+        await ctx.author.voice.channel.connect()
+        await player.play_next()
 
 
 @bot.command(name="playlists")
@@ -1628,7 +2144,7 @@ async def listplaylists_command(ctx):
 async def deleteplaylist_command(ctx, name: str):
     playlists = load_playlists(ctx.guild.id)
     if name not in playlists:
-        return await ctx.send(f"No playlist named `{name}`.")
+        return await ctx.send(f" No playlist named `{name}`.")
     del playlists[name]
     save_playlists(ctx.guild.id, playlists)
     await ctx.send(f" Deleted playlist **{name}**.")
